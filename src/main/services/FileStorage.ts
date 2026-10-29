@@ -1,42 +1,112 @@
-import { getFileType } from '@main/utils/file'
-import { documentExts, imageExts } from '@shared/config/constant'
-import { FileType } from '@types'
 import * as crypto from 'crypto'
-import {
-  app,
-  dialog,
-  OpenDialogOptions,
-  OpenDialogReturnValue,
-  SaveDialogOptions,
-  SaveDialogReturnValue,
-  shell
-} from 'electron'
-import logger from 'electron-log'
 import * as fs from 'fs'
 import { writeFileSync } from 'fs'
 import { readFile } from 'fs/promises'
-import officeParser from 'officeparser'
 import * as path from 'path'
-import { chdir } from 'process'
+
+import type { OpenDialogOptions, OpenDialogReturnValue, SaveDialogOptions, SaveDialogReturnValue } from 'electron'
+import { BrowserWindow, dialog, net, shell } from 'electron'
 import { v4 as uuidv4 } from 'uuid'
 
+/**
+ * @deprecated LEGACY v1 CODE — being migrated to `FileManager`
+ * (`src/main/services/file/FileManager.ts`). This file will be DELETED once
+ * the migration is complete.
+ *
+ * Do NOT add new features or new call sites here — route new file
+ * functionality through `FileManager` instead. Existing consumers should be
+ * migrated off this module as part of the ongoing migration.
+ */
+/* eslint-disable filepath-brand/no-as-filepath -- v1 raw-path regime: every
+ * public method here takes a bare `string` path straight from legacy IPC or an
+ * Electron dialog, with no validation layer of its own. Introducing
+ * `AbsoluteFilePathSchema.parse()` would add new throw sites to a module that is
+ * already `@deprecated` and slated for deletion, changing v1 behavior instead of
+ * migrating it. The casts only feed `getFileType` (extension reads). */
+import { application } from '@application'
+import { loggerService } from '@logger'
+import { isWin } from '@main/core/platform'
+import { t } from '@main/i18n'
+import { assertOutsideManagedStorageMutation } from '@main/services/file'
+import { getFileType } from '@main/utils/file'
+import { extractLegacyDocText } from '@main/utils/legacyDoc'
+import {
+  checkName,
+  getFileType as getFileTypeByExt,
+  getName,
+  readTextFileWithAutoEncoding,
+  sanitizeFilename
+} from '@main/utils/legacyFile'
+import type { FileMetadata } from '@shared/data/types/legacyFile'
+import type { AbsoluteFilePath } from '@shared/types/file'
+import { MB } from '@shared/utils/constants'
+import { parseDataUrl } from '@shared/utils/dataUrl'
+import { documentExts, imageExts } from '@shared/utils/file'
+
+const logger = loggerService.withContext('FileStorage')
+
+function normalizeTrashPath(filePath: string): string {
+  return process.platform === 'win32' ? path.win32.normalize(filePath) : path.posix.normalize(filePath)
+}
+
+// Missing or destroyed sender window falls back to the unparented overload.
+function resolveSaveDialogParent(event: Electron.IpcMainInvokeEvent): Electron.BrowserWindow | undefined {
+  const window = BrowserWindow.fromWebContents(event.sender)
+  return window && !window.isDestroyed() ? window : undefined
+}
+
 class FileStorage {
-  private storageDir = path.join(app.getPath('userData'), 'Data', 'Files')
-  private tempDir = path.join(app.getPath('temp'), 'CherryStudio')
-
-  constructor() {
-    this.initStorageDir()
+  // TODO(v2): Lazy getter is a workaround, not a fix.
+  //
+  // The real problem is that `FileStorage` is exported as a top-level
+  // singleton at the bottom of this file
+  // (`export const fileStorage = new FileStorage()`). That singleton is
+  // instantiated during the static import graph of `src/main/main.ts`
+  // (via both `ipc.ts` and the `ApiGatewayService → ApiGateway → routes
+  // → KnowledgeService` chain), BEFORE `application.bootstrap()` runs
+  // and builds the path registry. The previous shape used field
+  // initializers (`private storageDir = application.getPath(...)`),
+  // which threw "PATHS not initialized" at module-load time.
+  //
+  // Lazy getters defer the path lookup until first *access*, by which
+  // point bootstrap has finished — but the class itself is still being
+  // constructed too early. We've merely moved the path lookup out of
+  // construction; we have NOT solved the architectural issue.
+  //
+  // The proper v2 fix is to migrate `FileStorage` into the lifecycle
+  // system: extend `BaseService`, add `@Injectable`, register in
+  // `serviceRegistry.ts`, and have callers resolve it via
+  // `application.get('FileStorage')` instead of importing the singleton.
+  // Once that's done, the DI container will instantiate it inside
+  // `application.bootstrap()` after the path registry is built, and
+  // these getters can become plain field initializers (or move into
+  // `onInit`). Until then, keep them as getters — do NOT "simplify"
+  // them back to fields.
+  private get storageDir(): string {
+    return application.getPath('feature.files.data')
   }
 
-  private initStorageDir = (): void => {
-    if (!fs.existsSync(this.storageDir)) {
-      fs.mkdirSync(this.storageDir, { recursive: true })
+  /**
+   * Resolves an id that arrived from the renderer to a path inside the storage
+   * directory. `path.join` would happily normalize `..`, so an unvalidated id
+   * could read or delete any file the app can reach.
+   */
+  private resolveStoredPath(id: string): string {
+    const root = path.resolve(this.storageDir)
+    const resolved = path.resolve(root, id)
+    // The root itself is not a stored file; allowing it would let `deleteDir('')`
+    // remove every saved file.
+    if (resolved === root || !resolved.startsWith(root + path.sep)) {
+      throw new Error(`Invalid stored file id: ${id}`)
     }
-    if (!fs.existsSync(this.tempDir)) {
-      fs.mkdirSync(this.tempDir, { recursive: true })
-    }
+    return resolved
   }
 
+  private get tempDir(): string {
+    return application.getPath('app.temp')
+  }
+
+  // @TraceProperty({ spanName: 'getFileHash', tag: 'FileStorage' })
   private getFileHash = async (filePath: string): Promise<string> => {
     return new Promise((resolve, reject) => {
       const hash = crypto.createHash('md5')
@@ -47,8 +117,9 @@ class FileStorage {
     })
   }
 
-  findDuplicateFile = async (filePath: string): Promise<FileType | null> => {
+  private findDuplicateFile = async (filePath: string): Promise<FileMetadata | null> => {
     const stats = fs.statSync(filePath)
+    logger.debug(`stats: ${stats}, filePath: ${filePath}`)
     const fileSize = stats.size
 
     const files = await fs.promises.readdir(this.storageDir)
@@ -65,15 +136,17 @@ class FileStorage {
         if (originalHash === storedHash) {
           const ext = path.extname(file)
           const id = path.basename(file, ext)
+          const type = await getFileType(filePath as AbsoluteFilePath)
+
           return {
             id,
             origin_name: file,
             name: file + ext,
             path: storedFilePath,
-            created_at: storedStats.birthtime,
+            created_at: storedStats.birthtime.toISOString(),
             size: storedStats.size,
             ext,
-            type: getFileType(ext),
+            type,
             count: 2
           }
         }
@@ -86,7 +159,7 @@ class FileStorage {
   public selectFile = async (
     _: Electron.IpcMainInvokeEvent,
     options?: OpenDialogOptions
-  ): Promise<FileType[] | null> => {
+  ): Promise<FileMetadata[] | null> => {
     const defaultOptions: OpenDialogOptions = {
       properties: ['openFile']
     }
@@ -102,14 +175,14 @@ class FileStorage {
     const fileMetadataPromises = result.filePaths.map(async (filePath) => {
       const stats = fs.statSync(filePath)
       const ext = path.extname(filePath)
-      const fileType = getFileType(ext)
+      const fileType = await getFileType(filePath as AbsoluteFilePath)
 
       return {
         id: uuidv4(),
         origin_name: path.basename(filePath),
         name: path.basename(filePath),
         path: filePath,
-        created_at: stats.birthtime,
+        created_at: stats.birthtime.toISOString(),
         size: stats.size,
         ext: ext,
         type: fileType,
@@ -123,15 +196,15 @@ class FileStorage {
   private async compressImage(sourcePath: string, destPath: string): Promise<void> {
     try {
       const stats = fs.statSync(sourcePath)
-      const fileSizeInMB = stats.size / (1024 * 1024)
+      const fileSizeInMB = stats.size / MB
 
       // 如果图片大于1MB才进行压缩
       if (fileSizeInMB > 1) {
         try {
           await fs.promises.copyFile(sourcePath, destPath)
-          logger.info('[FileStorage] Image compressed successfully:', sourcePath)
+          logger.debug(`Image compressed successfully: ${sourcePath}`)
         } catch (jimpError) {
-          logger.error('[FileStorage] Image compression failed:', jimpError)
+          logger.error('Image compression failed:', jimpError as Error)
           await fs.promises.copyFile(sourcePath, destPath)
         }
       } else {
@@ -139,14 +212,15 @@ class FileStorage {
         await fs.promises.copyFile(sourcePath, destPath)
       }
     } catch (error) {
-      logger.error('[FileStorage] Image handling failed:', error)
+      logger.error('Image handling failed:', error as Error)
       // 错误情况下直接复制原文件
       await fs.promises.copyFile(sourcePath, destPath)
     }
   }
 
-  public uploadFile = async (_: Electron.IpcMainInvokeEvent, file: FileType): Promise<FileType> => {
-    const duplicateFile = await this.findDuplicateFile(file.path)
+  public uploadFile = async (_: Electron.IpcMainInvokeEvent, file: FileMetadata): Promise<FileMetadata> => {
+    const filePath = file.path
+    const duplicateFile = await this.findDuplicateFile(filePath)
 
     if (duplicateFile) {
       return duplicateFile
@@ -157,87 +231,319 @@ class FileStorage {
     const ext = path.extname(origin_name).toLowerCase()
     const destPath = path.join(this.storageDir, uuid + ext)
 
-    logger.info('[FileStorage] Uploading file:', file.path)
+    logger.info(`[FileStorage] Uploading file: ${filePath}`)
 
     // 根据文件类型选择处理方式
     if (imageExts.includes(ext)) {
-      await this.compressImage(file.path, destPath)
+      await this.compressImage(filePath, destPath)
     } else {
-      await fs.promises.copyFile(file.path, destPath)
+      await fs.promises.copyFile(filePath, destPath)
     }
 
     const stats = await fs.promises.stat(destPath)
-    const fileType = getFileType(ext)
+    const fileType = await getFileType(destPath as AbsoluteFilePath)
 
-    const fileMetadata: FileType = {
+    const fileMetadata: FileMetadata = {
       id: uuid,
       origin_name,
       name: uuid + ext,
       path: destPath,
-      created_at: stats.birthtime,
+      created_at: stats.birthtime.toISOString(),
       size: stats.size,
       ext: ext,
       type: fileType,
       count: 1
     }
 
+    logger.debug(`File uploaded: ${fileMetadata}`)
+
     return fileMetadata
   }
 
-  public getFile = async (_: Electron.IpcMainInvokeEvent, filePath: string): Promise<FileType | null> => {
+  public getFile = async (_: Electron.IpcMainInvokeEvent, filePath: string): Promise<FileMetadata | null> => {
     if (!fs.existsSync(filePath)) {
       return null
     }
 
     const stats = fs.statSync(filePath)
-    const ext = path.extname(filePath)
-    const fileType = getFileType(ext)
+    const fileType = await getFileType(filePath as AbsoluteFilePath)
 
-    const fileInfo: FileType = {
+    return {
       id: uuidv4(),
       origin_name: path.basename(filePath),
       name: path.basename(filePath),
       path: filePath,
-      created_at: stats.birthtime,
+      created_at: stats.birthtime.toISOString(),
       size: stats.size,
-      ext: ext,
+      ext: path.extname(filePath),
       type: fileType,
       count: 1
     }
-
-    return fileInfo
   }
 
+  // @TraceProperty({ spanName: 'deleteFile', tag: 'FileStorage' })
   public deleteFile = async (_: Electron.IpcMainInvokeEvent, id: string): Promise<void> => {
-    await fs.promises.unlink(path.join(this.storageDir, id))
+    if (!fs.existsSync(this.resolveStoredPath(id))) {
+      return
+    }
+    await fs.promises.unlink(this.resolveStoredPath(id))
   }
 
-  public readFile = async (_: Electron.IpcMainInvokeEvent, id: string): Promise<string> => {
-    const filePath = path.join(this.storageDir, id)
+  public deleteDir = async (_: Electron.IpcMainInvokeEvent, id: string): Promise<void> => {
+    if (!fs.existsSync(this.resolveStoredPath(id))) {
+      return
+    }
+    await fs.promises.rm(this.resolveStoredPath(id), { recursive: true })
+  }
 
-    if (documentExts.includes(path.extname(filePath))) {
-      const originalCwd = process.cwd()
+  public deleteExternalFile = async (_: Electron.IpcMainInvokeEvent, filePath: string): Promise<void> => {
+    try {
+      if (!filePath) return
+
+      const nativePath = normalizeTrashPath(filePath)
+      await assertOutsideManagedStorageMutation(nativePath)
+      if (!fs.existsSync(nativePath)) {
+        return
+      }
+
+      await shell.trashItem(nativePath)
+      logger.debug(`External file moved to trash successfully: ${nativePath}`)
+    } catch (error) {
+      logger.error('Failed to delete external file:', error as Error)
+      throw error
+    }
+  }
+
+  public deleteExternalDir = async (_: Electron.IpcMainInvokeEvent, dirPath: string): Promise<void> => {
+    try {
+      if (!dirPath) return
+
+      const nativePath = normalizeTrashPath(dirPath)
+      await assertOutsideManagedStorageMutation(nativePath)
+      if (!fs.existsSync(nativePath)) {
+        return
+      }
+
+      await shell.trashItem(nativePath)
+      logger.debug(`External directory moved to trash successfully: ${nativePath}`)
+    } catch (error) {
+      logger.error('Failed to delete external directory:', error as Error)
+      throw error
+    }
+  }
+
+  public moveFile = async (_: Electron.IpcMainInvokeEvent, filePath: string, newPath: string): Promise<void> => {
+    try {
+      await assertOutsideManagedStorageMutation(filePath, newPath)
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`Source file does not exist: ${filePath}`)
+      }
+
+      // 确保目标目录存在
+      const destDir = path.dirname(newPath)
+      if (!fs.existsSync(destDir)) {
+        await fs.promises.mkdir(destDir, { recursive: true })
+      }
+
+      // 移动文件
+      await fs.promises.rename(filePath, newPath)
+      logger.debug(`File moved successfully: ${filePath} to ${newPath}`)
+    } catch (error) {
+      logger.error('Move file failed:', error as Error)
+      throw error
+    }
+  }
+
+  public moveDir = async (_: Electron.IpcMainInvokeEvent, dirPath: string, newDirPath: string): Promise<void> => {
+    try {
+      await assertOutsideManagedStorageMutation(dirPath, newDirPath)
+      if (!fs.existsSync(dirPath)) {
+        throw new Error(`Source directory does not exist: ${dirPath}`)
+      }
+
+      // 确保目标父目录存在
+      const parentDir = path.dirname(newDirPath)
+      if (!fs.existsSync(parentDir)) {
+        await fs.promises.mkdir(parentDir, { recursive: true })
+      }
+
+      // 移动目录
+      await fs.promises.rename(dirPath, newDirPath)
+      logger.debug(`Directory moved successfully: ${dirPath} to ${newDirPath}`)
+    } catch (error) {
+      logger.error('Move directory failed:', error as Error)
+      throw error
+    }
+  }
+
+  public renameFile = async (_: Electron.IpcMainInvokeEvent, filePath: string, newName: string): Promise<void> => {
+    try {
+      if (!fs.existsSync(filePath)) {
+        throw new Error(`Source file does not exist: ${filePath}`)
+      }
+
+      const dirPath = path.dirname(filePath)
+      const newFilePath = path.join(dirPath, newName + '.md')
+      await assertOutsideManagedStorageMutation(filePath, newFilePath)
+
+      // 如果目标文件已存在，抛出错误
+      if (fs.existsSync(newFilePath)) {
+        throw new Error(`Target file already exists: ${newFilePath}`)
+      }
+
+      // 重命名文件
+      await fs.promises.rename(filePath, newFilePath)
+      logger.debug(`File renamed successfully: ${filePath} to ${newFilePath}`)
+    } catch (error) {
+      logger.error('Rename file failed:', error as Error)
+      throw error
+    }
+  }
+
+  public renameDir = async (_: Electron.IpcMainInvokeEvent, dirPath: string, newName: string): Promise<void> => {
+    try {
+      if (!fs.existsSync(dirPath)) {
+        throw new Error(`Source directory does not exist: ${dirPath}`)
+      }
+
+      const parentDir = path.dirname(dirPath)
+      const newDirPath = path.join(parentDir, newName)
+      await assertOutsideManagedStorageMutation(dirPath, newDirPath)
+
+      // 如果目标目录已存在，抛出错误
+      if (fs.existsSync(newDirPath)) {
+        throw new Error(`Target directory already exists: ${newDirPath}`)
+      }
+
+      // 重命名目录
+      await fs.promises.rename(dirPath, newDirPath)
+      logger.debug(`Directory renamed successfully: ${dirPath} to ${newDirPath}`)
+    } catch (error) {
+      logger.error('Rename directory failed:', error as Error)
+      throw error
+    }
+  }
+
+  /**
+   * Core file reading logic that handles both documents and text files.
+   *
+   * @private
+   * @param filePath - Full path to the file
+   * @param detectEncoding - Whether to auto-detect text file encoding
+   * @returns Promise resolving to the extracted text content
+   * @throws Error if file reading fails
+   */
+  private async readFileCore(filePath: string, detectEncoding: boolean = false): Promise<string> {
+    const fileExtension = path.extname(filePath).toLowerCase()
+
+    if (documentExts.includes(fileExtension)) {
       try {
-        chdir(this.tempDir)
-        const data = await officeParser.parseOfficeAsync(filePath)
-        chdir(originalCwd)
+        if (fileExtension === '.doc') {
+          // Awaited, so a failure reaches the catch below like every other
+          // document read here; returning the promise would settle it outside.
+          return await extractLegacyDocText(filePath)
+        }
+
+        // Delayed loading: officeparser (and the pdf stack it drags in) stays out of the boot path.
+        const { default: officeParser } = await import('officeparser')
+        const data = await officeParser.parseOfficeAsync(filePath, {
+          tempFilesLocation: this.tempDir
+        })
         return data
       } catch (error) {
-        chdir(originalCwd)
-        logger.error(error)
+        logger.error('Failed to read document file:', error as Error)
         throw error
       }
     }
 
-    return fs.readFileSync(filePath, 'utf8')
+    try {
+      if (detectEncoding) {
+        return readTextFileWithAutoEncoding(filePath)
+      } else {
+        return await fs.promises.readFile(filePath, 'utf-8')
+      }
+    } catch (error) {
+      logger.error('Failed to read text file:', error as Error)
+      throw new Error(`Failed to read file: ${filePath}.`)
+    }
+  }
+
+  /**
+   * Reads and extracts content from a stored file.
+   *
+   * Supports multiple file formats including:
+   * - Complex documents: .pdf, .doc, .docx, .pptx, .xlsx, .odt, .odp, .ods
+   * - Text files: .txt, .md, .json, .csv, etc.
+   * - Code files: .js, .ts, .py, .java, etc.
+   *
+   * For document formats, extracts text content using specialized parsers:
+   * - .doc files: Uses word-extractor library
+   * - Other Office formats: Uses officeparser library
+   *
+   * For text files, can optionally detect encoding automatically.
+   *
+   * @param _ - Electron IPC invoke event (unused)
+   * @param id - File identifier with extension (e.g., "uuid.docx")
+   * @param detectEncoding - Whether to auto-detect text file encoding (default: false)
+   * @returns Promise resolving to the extracted text content of the file
+   * @throws Error if file reading fails or file is not found
+   *
+   * @example
+   * // Read a DOCX file
+   * const content = await readFile(event, "document.docx");
+   *
+   * @example
+   * // Read a text file with encoding detection
+   * const content = await readFile(event, "text.txt", true);
+   *
+   * @example
+   * // Read a PDF file
+   * const content = await readFile(event, "manual.pdf");
+   */
+  public readFile = async (
+    _: Electron.IpcMainInvokeEvent,
+    id: string,
+    detectEncoding: boolean = false
+  ): Promise<string> => {
+    const filePath = this.resolveStoredPath(id)
+    return this.readFileCore(filePath, detectEncoding)
+  }
+
+  /**
+   * Reads and extracts content from an external file path.
+   *
+   * Similar to readFile, but operates on external file paths instead of stored files.
+   * Supports the same file formats including complex documents and text files.
+   *
+   * @param _ - Electron IPC invoke event (unused)
+   * @param filePath - Absolute path to the external file
+   * @param detectEncoding - Whether to auto-detect text file encoding (default: false)
+   * @returns Promise resolving to the extracted text content of the file
+   * @throws Error if file does not exist or reading fails
+   *
+   * @example
+   * // Read an external DOCX file
+   * const content = await readExternalFile(event, "/path/to/document.docx");
+   *
+   * @example
+   * // Read an external text file with encoding detection
+   * const content = await readExternalFile(event, "/path/to/text.txt", true);
+   */
+  public readExternalFile = async (
+    _: Electron.IpcMainInvokeEvent,
+    filePath: string,
+    detectEncoding: boolean = false
+  ): Promise<string> => {
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`File does not exist: ${filePath}`)
+    }
+
+    return this.readFileCore(filePath, detectEncoding)
   }
 
   public createTempFile = async (_: Electron.IpcMainInvokeEvent, fileName: string): Promise<string> => {
-    if (!fs.existsSync(this.tempDir)) {
-      fs.mkdirSync(this.tempDir, { recursive: true })
-    }
-    const tempFilePath = path.join(this.tempDir, `temp_file_${uuidv4()}_${fileName}`)
-    return tempFilePath
+    // `fileName` is renderer-supplied; basename it so a value like `../../evil` can't escape tempDir.
+    return path.join(this.tempDir, `temp_file_${uuidv4()}_${path.basename(fileName)}`)
   }
 
   public writeFile = async (
@@ -245,17 +551,50 @@ class FileStorage {
     filePath: string,
     data: Uint8Array | string
   ): Promise<void> => {
+    await assertOutsideManagedStorageMutation(filePath)
     await fs.promises.writeFile(filePath, data)
+  }
+
+  public fileNameGuard = async (
+    _: Electron.IpcMainInvokeEvent,
+    dirPath: string,
+    fileName: string,
+    isFile: boolean
+  ): Promise<{ safeName: string; exists: boolean }> => {
+    const safeName = checkName(fileName)
+    const finalName = getName(dirPath, safeName, isFile)
+    // `finalName` is deduplicated by `getName`, so it never exists on disk.
+    // `exists` must report whether the *requested* name is already taken,
+    // which is what the notes rename flow relies on.
+    const requestedPath = path.join(dirPath, sanitizeFilename(safeName) + (isFile ? '.md' : ''))
+    const exists = fs.existsSync(requestedPath)
+
+    logger.debug(`File name guard: ${fileName} -> ${finalName}, exists: ${exists}`)
+    return { safeName: finalName, exists }
+  }
+
+  public mkdir = async (_: Electron.IpcMainInvokeEvent, dirPath: string): Promise<string> => {
+    try {
+      await assertOutsideManagedStorageMutation(dirPath)
+      logger.debug(`Attempting to create directory: ${dirPath}`)
+      await fs.promises.mkdir(dirPath, { recursive: true })
+      return dirPath
+    } catch (error) {
+      logger.error('Failed to create directory:', error as Error)
+      throw new Error(`Failed to create directory: ${dirPath}. Error: ${(error as Error).message}`)
+    }
   }
 
   public base64Image = async (
     _: Electron.IpcMainInvokeEvent,
     id: string
   ): Promise<{ mime: string; base64: string; data: string }> => {
-    const filePath = path.join(this.storageDir, id)
+    const filePath = this.resolveStoredPath(id)
     const data = await fs.promises.readFile(filePath)
     const base64 = data.toString('base64')
-    const mime = `image/${path.extname(filePath).slice(1)}`
+    const rawExt = path.extname(filePath).slice(1)
+    const ext = rawExt === 'jpg' ? 'jpeg' : rawExt
+    const mime = ext ? `image/${ext}` : 'image/png'
     return {
       mime,
       base64,
@@ -263,97 +602,248 @@ class FileStorage {
     }
   }
 
-  public binaryFile = async (_: Electron.IpcMainInvokeEvent, id: string): Promise<{ data: Buffer; mime: string }> => {
-    const filePath = path.join(this.storageDir, id)
+  public saveBase64Image = async (_: Electron.IpcMainInvokeEvent, base64Data: string): Promise<FileMetadata> => {
+    try {
+      if (!base64Data) {
+        throw new Error('Base64 data is required')
+      }
+
+      const parseResult = parseDataUrl(base64Data)
+      const base64String = parseResult?.data ?? base64Data
+      const ext = parseResult?.mediaType ? this.getExtensionFromMimeType(parseResult.mediaType) : '.png'
+
+      const buffer = Buffer.from(base64String, 'base64')
+      const uuid = uuidv4()
+      const destPath = path.join(this.storageDir, uuid + ext)
+
+      logger.debug('Saving base64 image:', {
+        storageDir: this.storageDir,
+        destPath,
+        bufferSize: buffer.length
+      })
+
+      // 确保目录存在
+      if (!fs.existsSync(this.storageDir)) {
+        fs.mkdirSync(this.storageDir, { recursive: true })
+      }
+
+      await fs.promises.writeFile(destPath, buffer)
+
+      return {
+        id: uuid,
+        origin_name: uuid + ext,
+        name: uuid + ext,
+        path: destPath,
+        created_at: new Date().toISOString(),
+        size: buffer.length,
+        ext: ext.slice(1),
+        type: getFileTypeByExt(ext),
+        count: 1
+      }
+    } catch (error) {
+      logger.error('Failed to save base64 image:', error as Error)
+      throw error
+    }
+  }
+
+  public base64File = async (_: Electron.IpcMainInvokeEvent, id: string): Promise<{ data: string; mime: string }> => {
+    const filePath = this.resolveStoredPath(id)
+    const buffer = await fs.promises.readFile(filePath)
+    const base64 = buffer.toString('base64')
+    const mime = `application/${path.extname(filePath).slice(1)}`
+    return { data: base64, mime }
+  }
+
+  public pdfPageCount = async (_: Electron.IpcMainInvokeEvent, id: string): Promise<number> => {
+    const filePath = this.resolveStoredPath(id)
+    const buffer = await fs.promises.readFile(filePath)
+
+    const { PDFDocument } = await import('pdf-lib')
+    const pdfDoc = await PDFDocument.load(buffer)
+    return pdfDoc.getPageCount()
+  }
+
+  public binaryImage = async (_: Electron.IpcMainInvokeEvent, id: string): Promise<{ data: Buffer; mime: string }> => {
+    const filePath = this.resolveStoredPath(id)
     const data = await fs.promises.readFile(filePath)
     const mime = `image/${path.extname(filePath).slice(1)}`
     return { data, mime }
   }
 
   public clear = async (): Promise<void> => {
-    await fs.promises.rmdir(this.storageDir, { recursive: true })
-    await this.initStorageDir()
-  }
-
-  public clearTemp = async (): Promise<void> => {
-    await fs.promises.rmdir(this.tempDir, { recursive: true })
-    await fs.promises.mkdir(this.tempDir, { recursive: true })
+    await fs.promises.rm(this.storageDir, { recursive: true })
+    await fs.promises.mkdir(this.storageDir, { recursive: true })
   }
 
   public open = async (
     _: Electron.IpcMainInvokeEvent,
     options: OpenDialogOptions
-  ): Promise<{ fileName: string; filePath: string; content: Buffer } | null> => {
+  ): Promise<{ fileName: string; filePath: string; content?: Buffer; size: number } | null> => {
     try {
       const result: OpenDialogReturnValue = await dialog.showOpenDialog({
-        title: '打开文件',
+        title: t('dialog.open_file'),
         properties: ['openFile'],
-        filters: [{ name: '所有文件', extensions: ['*'] }],
+        filters: [{ name: t('dialog.all_files'), extensions: ['*'] }],
         ...options
       })
 
       if (!result.canceled && result.filePaths.length > 0) {
         const filePath = result.filePaths[0]
         const fileName = filePath.split('/').pop() || ''
-        const content = await readFile(filePath)
-        return { fileName, filePath, content }
+        const stats = await fs.promises.stat(filePath)
+
+        // If the file is less than 2GB, read the content
+        if (stats.size < 2 * 1024 * 1024 * 1024) {
+          const content = await readFile(filePath)
+          return { fileName, filePath, content, size: stats.size }
+        }
+
+        // For large files, only return file information, do not read content
+        return { fileName, filePath, size: stats.size }
       }
 
       return null
     } catch (err) {
-      logger.error('[IPC - Error]', 'An error occurred opening the file:', err)
+      logger.error('[IPC - Error] An error occurred opening the file:', err as Error)
       return null
     }
   }
 
-  public openPath = async (_: Electron.IpcMainInvokeEvent, path: string): Promise<void> => {
-    shell.openPath(path).catch((err) => logger.error('[IPC - Error] Failed to open file:', err))
+  /**
+   * 通过相对路径打开文件，跨设备时使用
+   * @param _
+   * @param file
+   */
+  public openFileWithRelativePath = async (_: Electron.IpcMainInvokeEvent, file: FileMetadata): Promise<void> => {
+    const filePath = path.join(this.storageDir, file.name)
+    if (fs.existsSync(filePath)) {
+      shell.openPath(filePath).catch((err) => logger.error('[IPC - Error] Failed to open file:', err))
+    } else {
+      logger.warn(`[IPC - Warning] File does not exist: ${filePath}`)
+    }
+  }
+
+  public validateNotesDirectory = async (_: Electron.IpcMainInvokeEvent, dirPath: string): Promise<boolean> => {
+    try {
+      if (!dirPath || typeof dirPath !== 'string') {
+        return false
+      }
+
+      // Normalize path
+      const normalizedPath = path.resolve(dirPath)
+
+      // Check if directory exists
+      if (!fs.existsSync(normalizedPath)) {
+        return false
+      }
+
+      // Check if it's actually a directory
+      const stats = fs.statSync(normalizedPath)
+      if (!stats.isDirectory()) {
+        return false
+      }
+
+      // Get app paths to prevent selection of restricted directories
+      const appDataPath = path.resolve(application.getPath('sys.appdata'))
+      const filesDir = path.resolve(application.getPath('feature.files.data'))
+      const currentNotesDir = path.resolve(application.getPath('feature.notes.data'))
+
+      // Prevent selecting app data directories
+      if (
+        normalizedPath.startsWith(filesDir) ||
+        normalizedPath.startsWith(appDataPath) ||
+        normalizedPath === currentNotesDir
+      ) {
+        logger.warn(`Invalid directory selection: ${normalizedPath} (app data directory)`)
+        return false
+      }
+
+      // Prevent selecting system root directories
+      const isSystemRoot = isWin
+        ? /^[a-zA-Z]:[\\/]?$/.test(normalizedPath)
+        : normalizedPath === '/' ||
+          normalizedPath === '/usr' ||
+          normalizedPath === '/etc' ||
+          normalizedPath === '/System'
+
+      if (isSystemRoot) {
+        logger.warn(`Invalid directory selection: ${normalizedPath} (system root directory)`)
+        return false
+      }
+
+      // Check write permissions
+      try {
+        fs.accessSync(normalizedPath, fs.constants.W_OK)
+      } catch (error) {
+        logger.warn(`Directory not writable: ${normalizedPath}`)
+        return false
+      }
+
+      return true
+    } catch (error) {
+      logger.error('Failed to validate notes directory:', error as Error)
+      return false
+    }
   }
 
   public save = async (
-    _: Electron.IpcMainInvokeEvent,
+    event: Electron.IpcMainInvokeEvent,
     fileName: string,
     content: string,
     options?: SaveDialogOptions
   ): Promise<string | null> => {
     try {
-      const result: SaveDialogReturnValue = await dialog.showSaveDialog({
-        title: '保存文件',
+      const dialogOptions: SaveDialogOptions = {
+        title: t('dialog.save_file'),
         defaultPath: fileName,
         ...options
-      })
+      }
+      const parent = resolveSaveDialogParent(event)
+      const result: SaveDialogReturnValue = parent
+        ? await dialog.showSaveDialog(parent, dialogOptions)
+        : await dialog.showSaveDialog(dialogOptions)
 
-      if (!result.canceled && result.filePath) {
-        await writeFileSync(result.filePath, content, { encoding: 'utf-8' })
+      if (result.canceled || !result.filePath) {
+        return null
       }
 
+      await assertOutsideManagedStorageMutation(result.filePath)
+      writeFileSync(result.filePath, content, { encoding: 'utf-8' })
+
       return result.filePath
-    } catch (err) {
-      logger.error('[IPC - Error]', 'An error occurred saving the file:', err)
-      return null
+    } catch (err: any) {
+      logger.error('[IPC - Error] An error occurred saving the file:', err as Error)
+      return Promise.reject('An error occurred saving the file: ' + err?.message)
     }
   }
 
-  public saveImage = async (_: Electron.IpcMainInvokeEvent, name: string, data: string): Promise<void> => {
+  public saveImage = async (event: Electron.IpcMainInvokeEvent, name: string, data: string): Promise<boolean> => {
     try {
-      const filePath = dialog.showSaveDialogSync({
+      const dialogOptions: SaveDialogOptions = {
         defaultPath: `${name}.png`,
-        filters: [{ name: 'PNG Image', extensions: ['png'] }]
-      })
+        filters: [{ name: t('dialog.png_image'), extensions: ['png'] }]
+      }
+      const parent = resolveSaveDialogParent(event)
+      const result: SaveDialogReturnValue = parent
+        ? await dialog.showSaveDialog(parent, dialogOptions)
+        : await dialog.showSaveDialog(dialogOptions)
 
-      if (filePath) {
-        const base64Data = data.replace(/^data:image\/png;base64,/, '')
-        fs.writeFileSync(filePath, base64Data, 'base64')
+      if (!result.canceled && result.filePath) {
+        await assertOutsideManagedStorageMutation(result.filePath)
+        const parseResult = parseDataUrl(data)
+        await fs.promises.writeFile(result.filePath, parseResult?.data ?? data, 'base64')
+        return true
       }
     } catch (error) {
-      logger.error('[IPC - Error]', 'An error occurred saving the image:', error)
+      logger.error('[IPC - Error] An error occurred saving the image:', error as Error)
     }
+    return false
   }
 
   public selectFolder = async (_: Electron.IpcMainInvokeEvent, options: OpenDialogOptions): Promise<string | null> => {
     try {
       const result: OpenDialogReturnValue = await dialog.showOpenDialog({
-        title: '选择文件夹',
+        title: t('dialog.select_folder'),
         properties: ['openDirectory'],
         ...options
       })
@@ -364,14 +854,18 @@ class FileStorage {
 
       return null
     } catch (err) {
-      logger.error('[IPC - Error]', 'An error occurred selecting the folder:', err)
+      logger.error('[IPC - Error] An error occurred selecting the folder:', err as Error)
       return null
     }
   }
 
-  public downloadFile = async (_: Electron.IpcMainInvokeEvent, url: string): Promise<FileType> => {
+  public downloadFile = async (
+    _: Electron.IpcMainInvokeEvent,
+    url: string,
+    isUseContentType?: boolean
+  ): Promise<FileMetadata> => {
     try {
-      const response = await fetch(url)
+      const response = await net.fetch(url)
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`)
       }
@@ -394,7 +888,7 @@ class FileStorage {
       }
 
       // 如果文件名没有后缀，根据Content-Type添加后缀
-      if (!filename.includes('.')) {
+      if (isUseContentType || !filename.includes('.')) {
         const contentType = response.headers.get('Content-Type')
         const ext = this.getExtensionFromMimeType(contentType)
         filename += ext
@@ -409,23 +903,21 @@ class FileStorage {
       await fs.promises.writeFile(destPath, buffer)
 
       const stats = await fs.promises.stat(destPath)
-      const fileType = getFileType(ext)
+      const fileType = await getFileType(destPath as AbsoluteFilePath)
 
-      const fileMetadata: FileType = {
+      return {
         id: uuid,
         origin_name: filename,
         name: uuid + ext,
         path: destPath,
-        created_at: stats.birthtime,
+        created_at: stats.birthtime.toISOString(),
         size: stats.size,
         ext: ext,
         type: fileType,
         count: 1
       }
-
-      return fileMetadata
     } catch (error) {
-      logger.error('[FileStorage] Download file error:', error)
+      logger.error('Download file error:', error as Error)
       throw error
     }
   }
@@ -437,6 +929,8 @@ class FileStorage {
       'image/jpeg': '.jpg',
       'image/png': '.png',
       'image/gif': '.gif',
+      'image/webp': '.webp',
+      'image/bmp': '.bmp',
       'application/pdf': '.pdf',
       'text/plain': '.txt',
       'application/msword': '.doc',
@@ -449,9 +943,10 @@ class FileStorage {
     return mimeToExtension[mimeType] || '.bin'
   }
 
+  // @TraceProperty({ spanName: 'copyFile', tag: 'FileStorage' })
   public copyFile = async (_: Electron.IpcMainInvokeEvent, id: string, destPath: string): Promise<void> => {
     try {
-      const sourcePath = path.join(this.storageDir, id)
+      const sourcePath = this.resolveStoredPath(id)
 
       // 确保目标目录存在
       const destDir = path.dirname(destPath)
@@ -461,12 +956,174 @@ class FileStorage {
 
       // 复制文件
       await fs.promises.copyFile(sourcePath, destPath)
-      logger.info('[FileStorage] File copied successfully:', { from: sourcePath, to: destPath })
+      logger.debug(`File copied successfully: ${sourcePath} to ${destPath}`)
     } catch (error) {
-      logger.error('[FileStorage] Copy file failed:', error)
+      logger.error('Copy file failed:', error as Error)
+      throw error
+    }
+  }
+
+  public writeFileWithId = async (_: Electron.IpcMainInvokeEvent, id: string, content: string): Promise<void> => {
+    try {
+      const filePath = this.resolveStoredPath(id)
+      logger.debug(`Writing file: ${filePath}`)
+
+      // 确保目录存在
+      if (!fs.existsSync(this.storageDir)) {
+        logger.debug(`Creating storage directory: ${this.storageDir}`)
+        fs.mkdirSync(this.storageDir, { recursive: true })
+      }
+
+      await fs.promises.writeFile(filePath, content, 'utf8')
+      logger.debug(`File written successfully: ${filePath}`)
+    } catch (error) {
+      logger.error('Failed to write file:', error as Error)
+      throw error
+    }
+  }
+
+  public getFilePathById(file: FileMetadata): string {
+    return path.join(this.storageDir, file.id + file.ext)
+  }
+
+  /**
+   * Batch upload markdown files from native File objects
+   * This handles all I/O operations in the Main process to avoid blocking Renderer
+   */
+  public batchUploadMarkdownFiles = async (
+    _: Electron.IpcMainInvokeEvent,
+    filePaths: string[],
+    targetPath: string
+  ): Promise<{
+    fileCount: number
+    folderCount: number
+    skippedFiles: number
+    failedFiles: number
+  }> => {
+    try {
+      logger.info('Starting batch upload', { fileCount: filePaths.length, targetPath })
+
+      const basePath = path.resolve(targetPath)
+      await assertOutsideManagedStorageMutation(basePath)
+      const MARKDOWN_EXTS = ['.md', '.markdown']
+
+      // Filter markdown files
+      const markdownFiles = filePaths.filter((filePath) => {
+        const ext = path.extname(filePath).toLowerCase()
+        return MARKDOWN_EXTS.includes(ext)
+      })
+
+      const skippedFiles = filePaths.length - markdownFiles.length
+
+      if (markdownFiles.length === 0) {
+        return { fileCount: 0, folderCount: 0, skippedFiles, failedFiles: 0 }
+      }
+
+      // Collect unique folders needed
+      const foldersSet = new Set<string>()
+      const fileOperations: Array<{ sourcePath: string; targetPath: string }> = []
+      let failedFiles = 0
+
+      for (const filePath of markdownFiles) {
+        try {
+          // Get relative path if file is from a directory upload
+          const fileName = path.basename(filePath)
+          const relativePath = path.dirname(filePath)
+
+          // Determine target directory structure
+          let targetDir = basePath
+          const folderParts: string[] = []
+
+          // Extract folder structure from file path for nested uploads
+          // This is a simplified version - in real scenario we'd need the original directory structure
+          if (relativePath && relativePath !== '.') {
+            const parts = relativePath.split(path.sep)
+            // Get the last few parts that represent the folder structure within upload
+            const relevantParts = parts.slice(Math.max(0, parts.length - 3))
+            folderParts.push(...relevantParts)
+          }
+
+          // Build target directory path
+          for (const part of folderParts) {
+            targetDir = path.join(targetDir, part)
+            foldersSet.add(targetDir)
+          }
+
+          // Determine final file name
+          const nameWithoutExt = fileName.endsWith('.md')
+            ? fileName.slice(0, -3)
+            : fileName.endsWith('.markdown')
+              ? fileName.slice(0, -9)
+              : fileName
+
+          const { safeName } = await this.fileNameGuard(_, targetDir, nameWithoutExt, true)
+          const finalPath = path.join(targetDir, safeName + '.md')
+
+          fileOperations.push({ sourcePath: filePath, targetPath: finalPath })
+        } catch (error) {
+          failedFiles += 1
+          logger.error('Failed to prepare file operation:', error as Error, { filePath })
+        }
+      }
+
+      // Create folders in order (shallow to deep)
+      const sortedFolders = Array.from(foldersSet).sort((a, b) => a.length - b.length)
+      for (const folder of sortedFolders) {
+        try {
+          if (!fs.existsSync(folder)) {
+            await fs.promises.mkdir(folder, { recursive: true })
+          }
+        } catch (error) {
+          logger.debug('Folder already exists or creation failed', { folder, error: (error as Error).message })
+        }
+      }
+
+      // Process files in batches
+      const BATCH_SIZE = 10 // Higher batch size since we're in Main process
+      let successCount = 0
+
+      for (let i = 0; i < fileOperations.length; i += BATCH_SIZE) {
+        const batch = fileOperations.slice(i, i + BATCH_SIZE)
+
+        const results = await Promise.allSettled(
+          batch.map(async (op) => {
+            // Read from source and write to target in Main process
+            const content = await fs.promises.readFile(op.sourcePath, 'utf-8')
+            await fs.promises.writeFile(op.targetPath, content, 'utf-8')
+            return true
+          })
+        )
+
+        results.forEach((result, index) => {
+          if (result.status === 'fulfilled') {
+            successCount++
+          } else {
+            failedFiles += 1
+            logger.error('Failed to upload file:', result.reason, {
+              file: batch[index].sourcePath
+            })
+          }
+        })
+      }
+
+      logger.info('Batch upload completed', {
+        successCount,
+        folderCount: foldersSet.size,
+        skippedFiles,
+        failedFiles
+      })
+
+      return {
+        fileCount: successCount,
+        folderCount: foldersSet.size,
+        skippedFiles,
+        failedFiles
+      }
+    } catch (error) {
+      logger.error('Batch upload failed:', error as Error)
       throw error
     }
   }
 }
 
-export default FileStorage
+export const fileStorage = new FileStorage()

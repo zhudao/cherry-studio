@@ -1,41 +1,71 @@
-import { isMac } from '@main/constant'
-import { locales } from '@main/utils/locales'
-import { app, Menu, MenuItemConstructorOptions, nativeImage, nativeTheme, Tray } from 'electron'
+import { win32 } from 'node:path'
+
+import type { MenuItemConstructorOptions } from 'electron'
+import { Menu, nativeImage, nativeTheme, Tray } from 'electron'
+import { v5 as uuidv5 } from 'uuid'
+
+import { application } from '@application'
+import { loggerService } from '@logger'
+import { type Activatable, BaseService, DependsOn, Injectable, Phase, ServicePhase } from '@main/core/lifecycle'
+import { isLinux, isMac, isPortable, isWin } from '@main/core/platform'
+import { getNormalizedExecutablePath } from '@main/core/preboot/userDataLocation'
+import { t } from '@main/i18n'
+import { getApplicationId } from '@main/utils/appEdition'
+import { isRunningWindowsExecutableSigned } from '@main/utils/windowsExecutableSignature'
 
 import icon from '../../../build/tray_icon.png?asset'
 import iconDark from '../../../build/tray_icon_dark.png?asset'
 import iconLight from '../../../build/tray_icon_light.png?asset'
-import { configManager } from './ConfigManager'
-import { windowService } from './WindowService'
 
-export class TrayService {
-  private static instance: TrayService
+const logger = loggerService.withContext('TrayService')
+
+/** Stable notification-area identity for Explorer (see #21294, #21484). */
+function getWindowsTrayGuid(): string {
+  const executablePath = win32.resolve(getNormalizedExecutablePath()).toLowerCase()
+  return uuidv5(`${getApplicationId()}:${executablePath}`, uuidv5.URL)
+}
+
+function shouldUseWindowsTrayGuid(): boolean {
+  if (!isPortable) return true
+  // Unsigned portable nightlies extract to a new path each launch; Explorer rejects a
+  // stable GUID that does not match the running unsigned executable path.
+  return isRunningWindowsExecutableSigned()
+}
+
+@Injectable('TrayService')
+@ServicePhase(Phase.WhenReady)
+@DependsOn(['ComputerUseService'])
+export class TrayService extends BaseService implements Activatable {
   private tray: Tray | null = null
+  private contextMenu: Menu | null = null
 
-  constructor() {
-    this.updateTray()
-    this.watchTrayChanges()
-    TrayService.instance = this
+  protected async onInit() {
+    this.watchConfigChanges()
+    this.registerDisposable(
+      application.get('ComputerUseService').onControlsChanged(() => {
+        void this.syncVisibility().catch((error) => logger.error('Failed to update control tray', error))
+      })
+    )
   }
 
-  public static getInstance() {
-    return TrayService.instance
+  protected async onReady() {
+    if (application.get('PreferenceService').get('app.tray.enabled')) {
+      await this.activate()
+    }
   }
 
-  private createTray() {
-    this.destroyTray()
-
+  onActivate(): void {
     const iconPath = isMac ? (nativeTheme.shouldUseDarkColors ? iconLight : iconDark) : icon
-    const tray = new Tray(iconPath)
+    const tray = isWin && shouldUseWindowsTrayGuid() ? new Tray(iconPath, getWindowsTrayGuid()) : new Tray(iconPath)
 
-    if (process.platform === 'win32') {
+    if (isWin) {
       tray.setImage(iconPath)
-    } else if (process.platform === 'darwin') {
+    } else if (isMac) {
       const image = nativeImage.createFromPath(iconPath)
       const resizedImage = image.resize({ width: 16, height: 16 })
       resizedImage.setTemplateImage(true)
       tray.setImage(resizedImage)
-    } else if (process.platform === 'linux') {
+    } else if (isLinux) {
       const image = nativeImage.createFromPath(iconPath)
       const resizedImage = image.resize({ width: 16, height: 16 })
       tray.setImage(resizedImage)
@@ -43,76 +73,156 @@ export class TrayService {
 
     this.tray = tray
 
-    const locale = locales[configManager.getLanguage()]
-    const { tray: trayLocale } = locale.translation
+    this.updateContextMenu()
 
-    const enableQuickAssistant = configManager.getEnableQuickAssistant()
-
-    const template = [
-      {
-        label: trayLocale.show_window,
-        click: () => windowService.showMainWindow()
-      },
-      enableQuickAssistant && {
-        label: trayLocale.show_mini_window,
-        click: () => windowService.showMiniWindow()
-      },
-      { type: 'separator' },
-      {
-        label: trayLocale.quit,
-        click: () => this.quit()
-      }
-    ].filter(Boolean) as MenuItemConstructorOptions[]
-
-    const contextMenu = Menu.buildFromTemplate(template)
-
-    if (process.platform === 'linux') {
-      this.tray.setContextMenu(contextMenu)
+    if (isLinux) {
+      this.tray.setContextMenu(this.contextMenu)
     }
 
     this.tray.setToolTip('Cherry Studio')
 
     this.tray.on('right-click', () => {
-      this.tray?.popUpContextMenu(contextMenu)
+      if (this.contextMenu) {
+        this.tray?.popUpContextMenu(this.contextMenu)
+      }
     })
 
     this.tray.on('click', () => {
-      if (enableQuickAssistant && configManager.getClickTrayToShowQuickAssistant()) {
-        windowService.showMiniWindow()
+      const preferenceService = application.get('PreferenceService')
+      const quickAssistantEnabled = preferenceService.get('feature.quick_assistant.enabled')
+      const clickTrayToShowQuickAssistant = preferenceService.get('feature.quick_assistant.click_tray_to_show')
+
+      if (quickAssistantEnabled && clickTrayToShowQuickAssistant) {
+        application.get('QuickAssistantService').showQuickAssistant()
       } else {
-        windowService.showMainWindow()
+        application.get('MainWindowService').showMainWindow()
       }
     })
   }
 
-  private updateTray() {
-    const showTray = configManager.getTray()
-    if (showTray) {
-      this.createTray()
-    } else {
-      this.destroyTray()
-    }
-  }
-
-  public restartTray() {
-    if (configManager.getTray()) {
-      this.destroyTray()
-      this.createTray()
-    }
-  }
-
-  private destroyTray() {
+  onDeactivate(): void {
     if (this.tray) {
       this.tray.destroy()
       this.tray = null
     }
+    this.contextMenu = null
   }
 
-  private watchTrayChanges() {
-    configManager.subscribe<boolean>('tray', () => this.updateTray())
+  private updateContextMenu() {
+    const preferenceService = application.get('PreferenceService')
+    const quickAssistantEnabled = preferenceService.get('feature.quick_assistant.enabled')
+    const selectionAssistantEnabled = preferenceService.get('feature.selection.enabled')
+
+    const template = [
+      {
+        label: t('tray.show_window'),
+        click: () => application.get('MainWindowService').showMainWindow()
+      },
+      quickAssistantEnabled && {
+        label: t('tray.show_quick_assistant'),
+        click: () => application.get('QuickAssistantService').showQuickAssistant()
+      },
+      (isWin || isMac) && {
+        label: t('selection.name') + (selectionAssistantEnabled ? ' - On' : ' - Off'),
+        click: () => {
+          application.get('SelectionService').toggleEnabled()
+          this.updateContextMenu()
+        }
+      },
+      ...this.computerUseMenu(),
+      { type: 'separator' },
+      {
+        label: t('tray.quit'),
+        click: () => this.quit()
+      }
+    ].filter(Boolean) as MenuItemConstructorOptions[]
+
+    this.contextMenu = Menu.buildFromTemplate(template)
+    if (isLinux) this.tray?.setContextMenu(this.contextMenu)
+  }
+
+  private computerUseMenu(): MenuItemConstructorOptions[] {
+    const service = application.get('ComputerUseService')
+    const controls = service.getControls()
+    if (!controls.length) return []
+    const statusLabels = {
+      opening: t('tray.computer_use.opening'),
+      active: t('tray.computer_use.active'),
+      stopping: t('tray.computer_use.stopping'),
+      stopped: t('tray.computer_use.stopped'),
+      unconfirmed: t('tray.computer_use.unconfirmed')
+    }
+    return [
+      {
+        label: t('tray.computer_use.title'),
+        submenu: [
+          ...controls.map(
+            (control): MenuItemConstructorOptions => ({
+              label: t('tray.computer_use.entry', {
+                app: (control.appName ?? t('tray.computer_use.all_apps')).replaceAll('&', '&&'),
+                task: control.label.replaceAll('&', '&&'),
+                status: statusLabels[control.status]
+              }),
+              submenu: [
+                {
+                  label: control.status === 'stopped' ? t('tray.computer_use.allow') : t('tray.computer_use.stop'),
+                  enabled: ['opening', 'active', 'stopped'].includes(control.status),
+                  click: () => {
+                    if (control.status === 'stopped') service.allowControl(control.ownerId, control.appId)
+                    else if (control.appId) void service.stopApp(control.ownerId, control.appId)
+                  }
+                }
+              ]
+            })
+          ),
+          { type: 'separator' },
+          {
+            label: t('tray.computer_use.stop_all'),
+            enabled: controls.some((control) => ['opening', 'active'].includes(control.status)),
+            click: () => {
+              void service.stopAll()
+            }
+          }
+        ]
+      }
+    ]
+  }
+
+  private async syncVisibility(): Promise<void> {
+    const needed =
+      application.get('PreferenceService').get('app.tray.enabled') ||
+      application.get('ComputerUseService').getControls().length > 0
+    if (needed) {
+      await this.activate()
+      this.updateContextMenu()
+    } else await this.deactivate()
+  }
+
+  private watchConfigChanges() {
+    const preferenceService = application.get('PreferenceService')
+    this.registerDisposable(
+      preferenceService.subscribeChange('app.tray.enabled', () => {
+        void this.syncVisibility().catch((error) => logger.error('Failed to update tray visibility', error))
+      })
+    )
+    this.registerDisposable(
+      preferenceService.subscribeChange('app.language', () => {
+        if (this.isActivated) this.updateContextMenu()
+      })
+    )
+    this.registerDisposable(
+      preferenceService.subscribeChange('feature.quick_assistant.enabled', () => {
+        if (this.isActivated) this.updateContextMenu()
+      })
+    )
+    this.registerDisposable(
+      preferenceService.subscribeChange('feature.selection.enabled', () => {
+        if (this.isActivated) this.updateContextMenu()
+      })
+    )
   }
 
   private quit() {
-    app.quit()
+    application.quit()
   }
 }

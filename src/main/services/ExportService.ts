@@ -1,42 +1,137 @@
-/* eslint-disable no-case-declarations */
+/* oxlint-disable no-case-declarations */
 // ExportService
 
-import { AlignmentType, BorderStyle, Document, HeadingLevel, Packer, Paragraph, ShadingType, TextRun } from 'docx'
-import { dialog } from 'electron'
-import Logger from 'electron-log'
-import MarkdownIt from 'markdown-it'
+import fs from 'fs'
 
-import FileStorage from './FileStorage'
+import type * as Docx from 'docx'
+import type { ExternalHyperlink, Table, TableCell, TableRow, TextRun } from 'docx'
+import { type BrowserWindow, dialog } from 'electron'
+import type MarkdownIt from 'markdown-it'
 
+import { application } from '@application'
+import { loggerService } from '@logger'
+import { t } from '@main/i18n'
+
+const logger = loggerService.withContext('ExportService')
 export class ExportService {
-  private fileManager: FileStorage
-  private md: MarkdownIt
-
-  constructor(fileManager: FileStorage) {
-    this.fileManager = fileManager
-    this.md = new MarkdownIt()
-  }
-
-  private convertMarkdownToDocxElements(markdown: string) {
-    const tokens = this.md.parse(markdown, {})
+  private convertMarkdownToDocxElements(markdown: string, md: MarkdownIt, docx: typeof Docx) {
+    const {
+      AlignmentType,
+      BorderStyle,
+      ExternalHyperlink,
+      HeadingLevel,
+      Paragraph,
+      ShadingType,
+      Table,
+      TableCell,
+      TableRow,
+      TextRun,
+      VerticalAlign,
+      WidthType
+    } = docx
+    const tokens = md.parse(markdown, {})
     const elements: any[] = []
-    let listLevel = 0
+    const listCounters: Array<number | null> = []
+    let quoteLevel = 0
+    const quoteBorder = { left: { style: BorderStyle.SINGLE, size: 3, color: 'CCCCCC' } }
+    let currentTable: Table | null = null
+    let currentRowCells: TableCell[] = []
+    let isHeaderRow = false
+    let tableColumnCount = 0
+    let tableRows: TableRow[] = [] // Store rows temporarily
 
-    const processInlineTokens = (tokens: any[]): TextRun[] => {
-      const runs: TextRun[] = []
-      for (const token of tokens) {
+    const inlineText = (tokens: any[]): string =>
+      tokens
+        .map((token) => {
+          switch (token.type) {
+            case 'text':
+            case 'code_inline':
+              return token.content
+            case 'softbreak':
+            case 'hardbreak':
+              return ' '
+            case 'image':
+              return inlineText(token.children)
+            default:
+              return ''
+          }
+        })
+        .join('')
+
+    const processInlineTokens = (
+      tokens: any[],
+      isHeaderRow: boolean,
+      isQuote = false
+    ): (TextRun | ExternalHyperlink)[] => {
+      const runs: (TextRun | ExternalHyperlink)[] = []
+      let linkRuns: TextRun[] = []
+      let linkUrl = ''
+      let boldStack = 0 // 跟踪嵌套的粗体标记
+      let italicStack = 0 // 跟踪嵌套的斜体标记
+      let strikeStack = 0
+
+      // Off flags are omitted rather than written as `false`: an explicit off overrides the
+      // paragraph style, e.g. the italics of Heading 4.
+      const runFormat = (): Docx.IRunOptions => ({
+        bold: isHeaderRow || boldStack > 0 || undefined,
+        italics: isQuote || italicStack > 0 || undefined,
+        strike: strikeStack > 0 || undefined
+      })
+
+      const pushRun = (options: Docx.IRunOptions) => {
+        if (linkUrl) {
+          linkRuns.push(new TextRun({ ...options, style: 'Hyperlink', color: '0000FF', underline: { type: 'single' } }))
+        } else {
+          runs.push(new TextRun(options))
+        }
+      }
+
+      for (let i = 0; i < tokens.length; i++) {
+        const token = tokens[i]
         switch (token.type) {
+          case 'link_open':
+            linkUrl = token.attrs.find((attr: [string, string]) => attr[0] === 'href')[1]
+            linkRuns = []
+            break
+          case 'link_close':
+            if (linkRuns.length > 0) {
+              runs.push(new ExternalHyperlink({ children: linkRuns, link: linkUrl }))
+            }
+            linkRuns = []
+            linkUrl = ''
+            break
+          case 'strong_open':
+            boldStack++
+            break
+          case 'strong_close':
+            boldStack--
+            break
+          case 'em_open':
+            italicStack++
+            break
+          case 'em_close':
+            italicStack--
+            break
+          case 's_open':
+            strikeStack++
+            break
+          case 's_close':
+            strikeStack--
+            break
+          case 'softbreak':
+            pushRun({ text: ' ' })
+            break
+          case 'hardbreak':
+            pushRun({ break: 1 })
+            break
           case 'text':
-            runs.push(new TextRun(token.content))
+            pushRun({ text: token.content, ...runFormat() })
             break
-          case 'strong':
-            runs.push(new TextRun({ text: token.content, bold: true }))
-            break
-          case 'em':
-            runs.push(new TextRun({ text: token.content, italics: true }))
+          case 'image':
+            pushRun({ text: inlineText(token.children), ...runFormat() })
             break
           case 'code_inline':
-            runs.push(new TextRun({ text: token.content, font: 'Consolas', size: 20 }))
+            pushRun({ text: token.content, font: 'Consolas', size: 20, ...runFormat() })
             break
         }
       }
@@ -45,15 +140,13 @@ export class ExportService {
 
     for (let i = 0; i < tokens.length; i++) {
       const token = tokens[i]
-
       switch (token.type) {
         case 'heading_open':
           // 获取标题级别 (h1 -> h6)
           const level = parseInt(token.tag.slice(1)) as 1 | 2 | 3 | 4 | 5 | 6
-          const headingText = tokens[i + 1].content
           elements.push(
             new Paragraph({
-              text: headingText,
+              children: processInlineTokens(tokens[i + 1].children || [], false),
               heading: HeadingLevel[`HEADING_${level}`],
               spacing: {
                 before: 240,
@@ -66,9 +159,11 @@ export class ExportService {
 
         case 'paragraph_open':
           const inlineTokens = tokens[i + 1].children || []
+          const quoteStyle = quoteLevel > 0 ? { indent: { left: quoteLevel * 720 }, border: quoteBorder } : {}
           elements.push(
             new Paragraph({
-              children: processInlineTokens(inlineTokens),
+              children: processInlineTokens(inlineTokens, false, quoteLevel > 0),
+              ...quoteStyle,
               spacing: {
                 before: 120,
                 after: 120
@@ -79,43 +174,57 @@ export class ExportService {
           break
 
         case 'bullet_list_open':
-          listLevel++
+          listCounters.push(null)
+          break
+
+        case 'ordered_list_open':
+          listCounters.push(Number(token.attrGet('start') ?? 1))
           break
 
         case 'bullet_list_close':
-          listLevel--
+        case 'ordered_list_close':
+          listCounters.pop()
           break
 
         case 'list_item_open':
-          const itemInlineTokens = tokens[i + 2].children || []
+          const itemNumber = listCounters[listCounters.length - 1]
+          if (itemNumber != null) {
+            listCounters[listCounters.length - 1] = itemNumber + 1
+          }
+          // Only a leading paragraph is inlined behind the marker; any other first block (code,
+          // quote, nested list) reaches its own handler so container levels stay balanced.
+          const hasLeadParagraph = tokens[i + 1].type === 'paragraph_open'
           elements.push(
             new Paragraph({
               children: [
-                new TextRun({ text: '•', bold: true }),
+                new TextRun({ text: itemNumber == null ? '•' : `${itemNumber}.`, bold: true }),
                 new TextRun({ text: '\t' }),
-                ...processInlineTokens(itemInlineTokens)
+                ...(hasLeadParagraph ? processInlineTokens(tokens[i + 2].children || [], false, quoteLevel > 0) : [])
               ],
-              indent: {
-                left: listLevel * 720
-              }
+              indent: { left: (listCounters.length + quoteLevel) * 720 },
+              ...(quoteLevel > 0 ? { border: quoteBorder } : {})
             })
           )
-          i += 3
+          if (hasLeadParagraph) {
+            i += 3
+          }
           break
 
+        case 'code_block':
         case 'fence': // 代码块
-          const codeLines = token.content.split('\n')
+          const codeLines = token.content.replace(/\n$/, '').split('\n')
           elements.push(
             new Paragraph({
               children: codeLines.map(
-                (line) =>
+                (line, index) =>
                   new TextRun({
-                    text: line + '\n',
+                    text: line,
                     font: 'Consolas',
                     size: 20,
-                    break: 1
+                    break: index === 0 ? 0 : 1
                   })
               ),
+              indent: { left: (listCounters.length + quoteLevel) * 720 },
               shading: {
                 type: ShadingType.SOLID,
                 color: 'F5F5F5'
@@ -144,32 +253,121 @@ export class ExportService {
           break
 
         case 'blockquote_open':
-          const quoteText = tokens[i + 2].content
-          elements.push(
-            new Paragraph({
-              children: [
-                new TextRun({
-                  text: quoteText,
-                  italics: true
-                })
-              ],
-              indent: {
-                left: 720
-              },
-              border: {
-                left: {
+          quoteLevel++
+          break
+
+        case 'blockquote_close':
+          quoteLevel--
+          break
+
+        // 表格处理
+        case 'table_open':
+          tableRows = [] // Reset table rows for new table
+          break
+
+        case 'thead_open':
+          isHeaderRow = true
+          break
+
+        case 'tbody_open':
+          isHeaderRow = false
+          break
+
+        case 'tr_open':
+          currentRowCells = []
+          break
+
+        case 'tr_close':
+          const row = new TableRow({
+            children: currentRowCells,
+            tableHeader: isHeaderRow
+          })
+          tableRows.push(row)
+          // 计算表格有多少列（针对第一行）
+          if (tableColumnCount === 0) {
+            tableColumnCount = currentRowCells.length
+          }
+          break
+
+        case 'th_open':
+        case 'td_open':
+          const isFirstColumn = currentRowCells.length === 0 // 判断是否是第一列
+          const borders = {
+            top: {
+              style: BorderStyle.NONE
+            },
+            bottom: isHeaderRow
+              ? {
                   style: BorderStyle.SINGLE,
-                  size: 3,
-                  color: 'CCCCCC'
+                  size: 0.5,
+                  color: '000000'
                 }
+              : {
+                  style: BorderStyle.NONE
+                },
+            left: {
+              style: BorderStyle.NONE
+            },
+            right: {
+              style: BorderStyle.NONE
+            }
+          }
+          const cellContent = tokens[i + 1]
+          const cellOptions = {
+            children: [
+              new Paragraph({
+                children: cellContent.children
+                  ? processInlineTokens(cellContent.children, isHeaderRow || isFirstColumn)
+                  : [new TextRun({ text: cellContent.content || '', bold: isHeaderRow || isFirstColumn })],
+                alignment: AlignmentType.CENTER
+              })
+            ],
+            verticalAlign: VerticalAlign.CENTER,
+            borders: borders
+          }
+          currentRowCells.push(new TableCell(cellOptions))
+          i += 2 // 跳过内容和结束标记
+          break
+        case 'table_close':
+          // Create table with the collected rows - avoid using protected properties
+          // Create the table with all rows
+          currentTable = new Table({
+            width: {
+              size: 100,
+              type: WidthType.PERCENTAGE
+            },
+            rows: tableRows,
+            borders: {
+              top: {
+                style: BorderStyle.SINGLE,
+                size: 1,
+                color: '000000'
               },
-              spacing: {
-                before: 120,
-                after: 120
+              bottom: {
+                style: BorderStyle.SINGLE,
+                size: 1,
+                color: '000000'
+              },
+              left: {
+                style: BorderStyle.NONE
+              },
+              right: {
+                style: BorderStyle.NONE
+              },
+              insideHorizontal: {
+                style: BorderStyle.NONE
+              },
+              insideVertical: {
+                style: BorderStyle.NONE
               }
-            })
-          )
-          i += 3
+            }
+          })
+          elements.push(currentTable)
+          currentTable = null
+          tableColumnCount = 0
+          tableRows = []
+          currentRowCells = []
+          isHeaderRow = false
           break
       }
     }
@@ -177,11 +375,32 @@ export class ExportService {
     return elements
   }
 
-  public exportToWord = async (_: Electron.IpcMainInvokeEvent, markdown: string, fileName: string): Promise<void> => {
+  public exportToWord = async (markdown: string, fileName: string, senderId?: string | null): Promise<boolean> => {
     try {
-      const elements = this.convertMarkdownToDocxElements(markdown)
+      // Dialog-first is perf-driven: canceling costs zero conversion, and the dialog
+      // opens without waiting on the markdown→docx conversion.
+      const dialogOptions = {
+        title: t('dialog.save_file'),
+        filters: [{ name: t('dialog.word_document'), extensions: ['docx'] }],
+        defaultPath: fileName
+      }
+      // Parented dialog avoids the unparented-save crash with Unicode names.
+      // Missing or destroyed caller window falls back to the unparented overload.
+      const candidate: BrowserWindow | undefined = senderId
+        ? application.get('WindowManager').getWindow(senderId)
+        : undefined
+      const parent = candidate && !candidate.isDestroyed() ? candidate : undefined
+      const { canceled, filePath } = parent
+        ? await dialog.showSaveDialog(parent, dialogOptions)
+        : await dialog.showSaveDialog(dialogOptions)
+      if (canceled || !filePath) {
+        return false
+      }
 
-      const doc = new Document({
+      const [{ default: MarkdownIt }, docx] = await Promise.all([import('markdown-it'), import('docx')])
+      const elements = this.convertMarkdownToDocxElements(markdown, new MarkdownIt(), docx)
+
+      const doc = new docx.Document({
         styles: {
           paragraphStyles: [
             {
@@ -202,20 +421,13 @@ export class ExportService {
         ]
       })
 
-      const buffer = await Packer.toBuffer(doc)
+      const buffer = await docx.Packer.toBuffer(doc)
 
-      const filePath = dialog.showSaveDialogSync({
-        title: '保存文件',
-        filters: [{ name: 'Word Document', extensions: ['docx'] }],
-        defaultPath: fileName
-      })
-
-      if (filePath) {
-        await this.fileManager.writeFile(_, filePath, buffer)
-        Logger.info('[ExportService] Document exported successfully')
-      }
+      await fs.promises.writeFile(filePath, buffer)
+      logger.debug('Document exported successfully')
+      return true
     } catch (error) {
-      Logger.error('[ExportService] Export to Word failed:', error)
+      logger.error('Export to Word failed:', error as Error)
       throw error
     }
   }
