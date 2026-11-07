@@ -92,11 +92,6 @@ const HomePage: FC = () => {
   const navigate = useNavigate()
   const routeTopicId = routeSearch.topicId
   const routeAssistantId = routeSearch.assistantId
-  const handleManualPaneOpen = useCallback(() => {
-    requestAnimationFrame(() => {
-      void EventEmitter.emit(EVENT_NAMES.SHOW_ASSISTANTS)
-    })
-  }, [])
   const {
     isWindowFrame,
     shellPaneOpen,
@@ -107,8 +102,7 @@ const HomePage: FC = () => {
     handlePaneAutoCollapseChange
   } = useConversationShellPaneState({
     persistedPaneOpen: showSidebar,
-    setPersistedPaneOpen: setShowSidebar,
-    onManualPaneOpen: handleManualPaneOpen
+    setPersistedPaneOpen: setShowSidebar
   })
   const topicListPosition: ChatPanePosition =
     !isWindowFrame && isClassicTopicLayout && panePosition === 'right' ? 'right' : 'left'
@@ -292,7 +286,6 @@ const HomePage: FC = () => {
     })
 
     return unsubscribe
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `useEffectEvent` reads the latest topic without resubscribing.
   }, [currentTabId])
 
   const visibleAssistantId = visibleTopic?.assistantId
@@ -308,13 +301,18 @@ const HomePage: FC = () => {
     }
   }, [allTopics, isClassicTopicLayout, topicListPosition, t, visibleAssistantId])
   const targetTopicId = activeTopicId ?? undefined
-  const { locateMessageId, requestLocate, clearLocate } = useConversationLocateRequest({
+  const { locateMessageId, locateToEnd, requestLocate, clearLocate } = useConversationLocateRequest({
+    navigationTabId: currentTabId ?? undefined,
     activeConversationId: targetTopicId,
     visibleConversationId: visibleTopic?.id
   })
   // Label this tab with its assistant emoji + topic name so multiple chat tabs are distinguishable.
   const preserveTabVisuals = !!targetTopicId && visibleTopic?.id !== targetTopicId
   const tabTitle = visibleTopic?.name?.trim() || visibleAssistant?.name?.trim() || getDefaultRouteTitle('/app/chat')
+
+  useEffect(() => {
+    if (locateMessageId || locateToEnd) closeSurface()
+  }, [closeSurface, locateMessageId, locateToEnd])
 
   useEffect(() => {
     if (activeTopic) lastVisibleTopicRef.current = activeTopic
@@ -587,7 +585,6 @@ const HomePage: FC = () => {
       unsubscribe()
       unsubscribeMessage()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `useEffectEvent` reads latest tab/topic state without resubscribing.
   }, [currentTabId])
 
   const handleLocateMessageHandled = clearLocate
@@ -782,6 +779,7 @@ const HomePage: FC = () => {
             sidebarOpen={shellPaneOpen}
             onSidebarToggle={toggleShellPane}
             locateMessageId={locateMessageId}
+            locateToEnd={locateToEnd}
             onLocateMessageHandled={handleLocateMessageHandled}
             resourcePaneCount={topicResourcePaneCount}
           />
