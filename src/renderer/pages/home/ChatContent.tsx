@@ -4,7 +4,6 @@ import { useTranslation } from 'react-i18next'
 
 import { MessageEditingProvider } from '@renderer/components/chat/editing/MessageEditingContext'
 import type { TopicMessageFlowLiveState } from '@renderer/components/chat/flow'
-import { RefreshProvider } from '@renderer/components/chat/messages/blocks/MessagePartsContext'
 import type { MessageListActions, MessageListSelectAllPagination } from '@renderer/components/chat/messages/types'
 import { ConversationGreeting } from '@renderer/components/chat/shell/ConversationGreeting'
 import ConversationStageCenter from '@renderer/components/chat/shell/ConversationStageCenter'
@@ -21,6 +20,7 @@ import { SiblingsProvider } from '@renderer/hooks/SiblingsContext'
 import { useTopicMessages } from '@renderer/hooks/useTopicMessages'
 import { EVENT_NAMES, EventEmitter } from '@renderer/services/EventService'
 import type { Topic } from '@renderer/types/topic'
+import { endsWithProviderQuotaError } from '@renderer/utils/message/providerQuotaError'
 import type { CherryUIMessage } from '@shared/data/types/message'
 import { isUniqueModelId, type UniqueModelId } from '@shared/data/types/model'
 import type { Provider } from '@shared/data/types/provider'
@@ -76,8 +76,10 @@ const ChatContent: FC<Props> = ({
 }) => {
   const {
     uiMessages,
+    displayIndex,
     siblingsMap,
     pathMessages,
+    replyHistory,
     isLoading: isHistoryLoading,
     isStale: isHistoryStale,
     refresh,
@@ -104,10 +106,11 @@ const ChatContent: FC<Props> = ({
       composerModelId={composerModelId}
       isHistoryLoading={isHistoryLoading}
       isHistoryStale={isHistoryStale}
-      initialMessages={uiMessages}
+      displayIndex={displayIndex}
       uiMessages={uiMessages}
       siblingsMap={siblingsMap}
       pathMessages={pathMessages}
+      replyHistory={replyHistory}
       refresh={refresh}
       activeNodeId={activeNodeId}
       loadOlder={loadOlder}
@@ -126,13 +129,13 @@ interface InnerProps extends Props {
   isHistoryLoading: boolean
   isHistoryStale: boolean
   onBranchLiveStateChange?: (state: TopicMessageFlowLiveState | null) => void
-  /** One-time seed for `useChat(messages:)` — consumed on mount only. */
-  initialMessages: CherryUIMessage[]
   /** Live DB-backed message list; reactive to SWR refreshes. */
   uiMessages: CherryUIMessage[]
+  displayIndex: ReturnType<typeof useTopicMessages>['displayIndex']
   siblingsMap: ReturnType<typeof useTopicMessages>['siblingsMap']
   pathMessages: ReturnType<typeof useTopicMessages>['pathMessages']
-  refresh: () => Promise<CherryUIMessage[]>
+  replyHistory: ReturnType<typeof useTopicMessages>['replyHistory']
+  refresh: () => Promise<void>
   activeNodeId: string | null
   loadOlder: () => void
   hasOlder: boolean
@@ -155,10 +158,11 @@ const ChatContentInner: FC<InnerProps> = ({
   composerModelId,
   isHistoryLoading,
   isHistoryStale,
-  initialMessages,
   uiMessages,
+  displayIndex,
   siblingsMap,
   pathMessages,
+  replyHistory,
   refresh,
   activeNodeId,
   loadOlder,
@@ -174,8 +178,9 @@ const ChatContentInner: FC<InnerProps> = ({
   const runtime = useChatRuntimeState({
     topic,
     isHistoryLoading,
-    initialMessages,
+    replyHistory,
     uiMessages,
+    displayIndex,
     refresh,
     activeNodeId,
     messagesCacheMutate,
@@ -246,6 +251,10 @@ const ChatContentInner: FC<InnerProps> = ({
     }
     return { contextTokens, modelId }
   }, [activeNodeId, isHistoryStale, uiMessages])
+  const providerQuotaExhausted = useMemo(
+    () => !isHistoryStale && endsWithProviderQuotaError(uiMessages, activeNodeId),
+    [activeNodeId, isHistoryStale, uiMessages]
+  )
 
   useEffect(() => {
     if (!locateMessageId && !locateToEnd) {
@@ -317,6 +326,7 @@ const ChatContentInner: FC<InnerProps> = ({
       placement="home"
       topic={topic}
       contextUsage={contextUsage}
+      providerQuotaExhausted={providerQuotaExhausted}
       onSend={runtime.sendMessage}
       chatTarget={runtime.composerChatTarget}
       onNewTopic={onNewTopic}
@@ -330,6 +340,7 @@ const ChatContentInner: FC<InnerProps> = ({
       placement="docked"
       topic={topic}
       contextUsage={contextUsage}
+      providerQuotaExhausted={providerQuotaExhausted}
       onSend={runtime.sendMessage}
       chatTarget={runtime.composerChatTarget}
       onNewTopic={onNewTopic}
@@ -346,12 +357,10 @@ const ChatContentInner: FC<InnerProps> = ({
   return (
     <ChatWriteProvider value={runtime.chatWriteActions}>
       <SiblingsProvider value={siblingsContextValue}>
-        <RefreshProvider value={refresh}>
-          <MessageEditingProvider>
-            <ConversationStageCenter placement={placement} main={main} composer={composer} />
-            <ResourceEditDialogEventHost />
-          </MessageEditingProvider>
-        </RefreshProvider>
+        <MessageEditingProvider>
+          <ConversationStageCenter placement={placement} main={main} composer={composer} />
+          <ResourceEditDialogEventHost />
+        </MessageEditingProvider>
       </SiblingsProvider>
     </ChatWriteProvider>
   )
