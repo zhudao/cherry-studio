@@ -79,7 +79,9 @@ policy and checks route-bound tool continuations. An eligible fallback, a
 model retry policy, or a replay route guard can install the wrapper. Key failover
 is attempted first for 401/429 responses. When model retry is enabled, a selected
 replacement key still receives the configured same-model retry for other
-retryable errors (such as 503/529) before cross-model fallback begins.
+retryable errors (such as 503/529) before cross-model fallback begins. A recognized
+context overflow reaches retry from the provider adapter as a non-retryable
+failure. Chat context recovery can retry with a compacted prompt.
 
 ```ts
 // ai-retry's condition-based API (ai-retry/language-model). The retry STRATEGY
@@ -170,9 +172,12 @@ Pi and Pi Durable internal object requests reuse `createRetryableWrap` through t
 caller-owned single-step path. `RuntimeExecutor.streamText` / `generateText` apply the
 wrapper after provider middleware. An explicit request count enables three retries,
 independently of the chat retry toggle and count; backoff uses `chat.retry.backoff_enabled`.
-Native and AI SDK built-in retries remain disabled. The Gateway selects the
-serving key once per request. Retries use that key and model, and only run before
-the first content chunk is forwarded.
+The Gateway selects the serving key once per request. Its retries use that key and
+model before the first content chunk is forwarded. AI SDK built-in retries remain
+disabled. The AI SDK integration sets the retry budget and backoff for recognized transport failures
+in Pi Durable, including failures after content has been forwarded. Pi Durable persists the plan
+and resumes the generation at the scheduled time. See
+[Pi Durable model recovery](../../../../src/main/ai/runtime/piDurable/README.md).
 An explicit zero keeps HTTP gateway requests outside the wrapper. See the
 [Pi model request contract](../../../../src/main/ai/runtime/pi/README.md#model-requests).
 
